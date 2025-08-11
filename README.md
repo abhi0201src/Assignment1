@@ -1,31 +1,65 @@
-# Build an API with Django and Nextjs
+# Django + Next.js AWS Deployment
 
-This is a simple example of how to build an API with Django, React, and Docker. You can find the
-article concerning this code here on my [blog](https://koladev.xyz/posts/django-nextjs-crud/).
+This project demonstrates a full CI/CD pipeline for deploying a Django backend and Next.js frontend to AWS ECS with Terraform infrastructure.
 
-## Starting with Django and React
+## Features
 
-First launch the API server.
+- 🚀 Automated CI/CD pipeline with GitHub Actions
+- ☁️ Infrastructure as Code with Terraform
+- 🐳 Dockerized applications
+- 🔄 Zero-downtime deployments
+- 🛡️ Secure AWS configuration
+
+## Prerequisites
+
+- AWS account with proper permissions
+- Terraform installed (for local development)
+- Docker installed
+- GitHub repository with AWS secrets configured
+
+## Infrastructure Components
+
+- AWS ECS with Fargate
+- Application Load Balancer
+- ECR repositories for Docker images
+- VPC with public and private subnets
+- Security groups for network isolation
+
+## How to Use
+
+### Deploying the Application
+
+1. Push to the `main` branch to trigger automatic deployment
+2. Or manually trigger the workflow from GitHub Actions UI
+
+### Destroying the Infrastructure
+
+1. Go to GitHub Actions
+2. Select the "Build and Deploy" workflow
+3. Click "Run workflow"
+4. Check the "Destroy all infrastructure?" option
+5. Click "Run workflow"
+
+⚠️ **Warning**: This will permanently delete all AWS resources!
+
+### Environment Variables
+
+Required GitHub Secrets:
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `ECS_EXECUTION_ROLE_ARN`
+
+### Local Development
 
 ```bash
-cd django-api-nextjs
-python3.11 -m venv venv
+# Backend
+cd backend
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-
-python manage.py migrate
 python manage.py runserver
-```
 
-The API server will be available at `http://localhost:8000/`.
-
-Then launch the React client.
-
-```bash
-cd menu-frontend
+# Frontend
+cd frontend
 npm install
 npm run dev
-```
-
-The React client will be available at `http://localhost:3000/`.
-
-Feel free to open issues on the [GitHub repository](https://github.com/koladev32/django-api-nextjs) if you have any questions.
