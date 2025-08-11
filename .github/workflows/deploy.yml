@@ -20,6 +20,10 @@ env:
   BACKEND_ECR_REPOSITORY: django-nextjs-backend
   PROJECT_NAME: django-nextjs
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -84,11 +88,13 @@ jobs:
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-Destroy
 
       - name: Check for destroy flag
         id: check-destroy
@@ -159,18 +165,56 @@ jobs:
           terraform plan -destroy -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan
           echo "✅ Terraform destroy plan completed"
 
-      - name: Terraform Apply or Destroy
+      - name: Terraform Destroy Infrastructure
+        if: ${{ steps.check-destroy.outputs.destroy_requested }}
         working-directory: terraform
         run: |
-          if [ "${{ steps.check-destroy.outputs.destroy_requested }}" = "true" ]; then
-            echo "💥 Destroying infrastructure..."
-            terraform apply -destroy -auto-approve tfplan
-            echo "✅ Infrastructure destroyed successfully"
+          echo "💥 Destroying infrastructure in sequence..."
+          # Destroy services first
+          terraform destroy -target aws_ecs_service.frontend -auto-approve
+          terraform destroy -target aws_ecs_service.backend -auto-approve
+          # Then destroy remaining resources
+          terraform destroy -auto-approve
+          echo "✅ Terraform destroy completed"
+
+      - name: Cleanup ECR Images
+        if: ${{ steps.check-destroy.outputs.destroy_requested }}
+        run: |
+          echo "🧹 Cleaning up ECR images..."
+          for repo in ${{ env.FRONTEND_ECR_REPOSITORY }} ${{ env.BACKEND_ECR_REPOSITORY }}; do
+            echo "Deleting images in $repo"
+            aws ecr batch-delete-image \
+              --repository-name $repo \
+              --image-ids imageTag=latest imageTag=${{ github.sha }} \
+              --region ${{ env.AWS_REGION }} || echo "No images to delete in $repo"
+          done
+
+      - name: Verify Destruction
+        if: ${{ steps.check-destroy.outputs.destroy_requested }}
+        run: |
+          echo "🔍 Verifying resource deletion..."
+          # Check ECS Cluster
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters ${{ env.ECS_CLUSTER }} \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$CLUSTER_STATUS" = "INACTIVE" ] || [ "$CLUSTER_STATUS" = "NOT_FOUND" ]; then
+            echo "✅ ECS Cluster deleted"
           else
-            echo "🚀 Applying Terraform configuration..."
-            terraform apply -auto-approve tfplan
-            echo "✅ Terraform apply completed successfully"
-            terraform output || echo "No outputs available yet"
+            echo "::warning::ECS Cluster still exists with status: $CLUSTER_STATUS"
+          fi
+          
+          # Check Load Balancer
+          ALB_EXISTS=$(aws elbv2 describe-load-balancers \
+            --names "${PROJECT_NAME}-alb" \
+            --query 'length(LoadBalancers)' \
+            --output text 2>/dev/null || echo "0")
+            
+          if [ "$ALB_EXISTS" = "0" ]; then
+            echo "✅ ALB deleted"
+          else
+            echo "::warning::ALB still exists"
           fi
 
       - name: Wait for infrastructure to be ready
@@ -242,7 +286,7 @@ jobs:
   build-and-deploy:
     needs: [test, infrastructure]
     runs-on: ubuntu-latest
-    if: ${{ github.ref == 'refs/heads/main' && !needs.infrastructure.outputs.destroy-requested }}
+    if: ${{ github.ref == 'refs/heads/main' && needs.infrastructure.outputs.destroy-requested != 'true' }}
     
     steps:
       - uses: actions/checkout@v3
@@ -255,7 +299,7 @@ jobs:
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
