@@ -1,0 +1,21 @@
+# Trivy configuration file
+vulnerability:
+  ignore-unfixed: true
+  severity:
+    - CRITICAL
+    - HIGH
+
+secret:
+  # Disable secret scanning for test files
+  exclude-path:
+    - '**/tests/**'
+    - '**/test/**'
+    - '**/*.test.*'
+    - '**/*_test.*'
+
+misconfiguration:
+  # Include all available rules
+  include-all: true
+  # Ignore rules for development configurations
+  exclude:
+    - kubernetes-service
