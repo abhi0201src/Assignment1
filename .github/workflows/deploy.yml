@@ -1,12 +1,17 @@
 name: Build and Deploy
 
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      destroy_infrastructure:
+        description: 'Destroy all infrastructure?'
+        type: boolean
+        required: false
+        default: false
 
 env:
   AWS_REGION: us-west-2
@@ -48,7 +53,6 @@ jobs:
         working-directory: menu-frontend
         run: npm ci
 
-      # Skipping frontend tests for now as they're not set up
       - name: Run Frontend Lint
         working-directory: menu-frontend
         run: |
@@ -67,6 +71,7 @@ jobs:
       frontend-service: ${{ steps.infra-outputs.outputs.frontend-service }}
       backend-service: ${{ steps.infra-outputs.outputs.backend-service }}
       alb-dns: ${{ steps.infra-outputs.outputs.alb-dns }}
+      destroy-requested: ${{ steps.check-destroy.outputs.destroy_requested }}
 
     steps:
       - uses: actions/checkout@v3
@@ -85,6 +90,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check for destroy flag
+        id: check-destroy
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.destroy_infrastructure == 'true' }}
+        run: echo "destroy_requested=true" >> $GITHUB_OUTPUT
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
@@ -92,24 +102,21 @@ jobs:
           terraform_wrapper: false
 
       - name: Create Terraform S3 backend bucket
+        if: ${{ !steps.check-destroy.outputs.destroy_requested }}
         run: |
-          # Use a unique bucket name based on AWS account and project
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           BACKEND_BUCKET="${PROJECT_NAME}-terraform-state-${ACCOUNT_ID}"
           
           echo "Using Terraform backend bucket: $BACKEND_BUCKET"
           
-          # Check if bucket exists, create if it doesn't
           if ! aws s3 ls "s3://$BACKEND_BUCKET" 2>/dev/null; then
             echo "Creating S3 bucket for Terraform backend..."
             aws s3 mb "s3://$BACKEND_BUCKET" --region ${{ env.AWS_REGION }}
             
-            # Enable versioning for state file safety
             aws s3api put-bucket-versioning \
               --bucket "$BACKEND_BUCKET" \
               --versioning-configuration Status=Enabled
             
-            # Enable server-side encryption
             aws s3api put-bucket-encryption \
               --bucket "$BACKEND_BUCKET" \
               --server-side-encryption-configuration '{
@@ -126,63 +133,51 @@ jobs:
             echo "✅ Terraform backend bucket already exists"
           fi
           
-          # Update backend configuration with the correct bucket name
           sed -i "s/bucket  = \"devopsbackend-new\"/bucket  = \"$BACKEND_BUCKET\"/" terraform/backend.tf
 
       - name: Terraform Init
         working-directory: terraform
         run: |
           echo "🔧 Initializing Terraform..."
-          
-          # Remove any existing .terraform directory to ensure clean init
           rm -rf .terraform
-          
-          # Try normal init first
-          if ! terraform init; then
-            echo "Normal init failed, trying with -reconfigure..."
-            if ! terraform init -reconfigure; then
-              echo "Reconfigure failed, trying with -upgrade..."
-              if ! terraform init -reconfigure -upgrade; then
-                echo "Removing lock file and trying again..."
-                rm -f .terraform.lock.hcl
-                terraform init -reconfigure -upgrade
-              fi
-            fi
-          fi
+          terraform init -reconfigure -upgrade
           echo "✅ Terraform initialization completed"
 
       - name: Terraform Plan
+        if: ${{ !steps.check-destroy.outputs.destroy_requested }}
         working-directory: terraform
         run: |
           echo "🔍 Running Terraform plan..."
           terraform plan -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan
           echo "✅ Terraform plan completed successfully"
 
-      - name: Terraform Apply
+      - name: Terraform Plan (Destroy)
+        if: ${{ steps.check-destroy.outputs.destroy_requested }}
         working-directory: terraform
         run: |
-          echo "🚀 Applying Terraform configuration..."
-          
-          if ! terraform apply -auto-approve tfplan; then
-            echo "::error::Terraform apply failed"
-            echo "Showing terraform plan for debugging:"
-            terraform show tfplan || true
-            echo "Checking for any existing resources:"
-            terraform state list || true
-            exit 1
+          echo "🔍 Running Terraform destroy plan..."
+          terraform plan -destroy -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan
+          echo "✅ Terraform destroy plan completed"
+
+      - name: Terraform Apply or Destroy
+        working-directory: terraform
+        run: |
+          if ${{ steps.check-destroy.outputs.destroy_requested }}; then
+            echo "💥 Destroying infrastructure..."
+            terraform apply -destroy -auto-approve tfplan
+            echo "✅ Infrastructure destroyed successfully"
+            exit 0
+          else
+            echo "🚀 Applying Terraform configuration..."
+            terraform apply -auto-approve tfplan
+            echo "✅ Terraform apply completed successfully"
+            terraform output || echo "No outputs available yet"
           fi
-          
-          echo "✅ Terraform apply completed successfully"
-          
-          # Show key outputs for verification
-          echo "📋 Infrastructure Summary:"
-          terraform output || echo "No outputs available yet"
 
       - name: Wait for infrastructure to be ready
+        if: ${{ !steps.check-destroy.outputs.destroy_requested }}
         run: |
           echo "Verifying ECS cluster is active..."
-          
-          # Check if cluster exists and is active
           CLUSTER_STATUS=$(aws ecs describe-clusters --clusters ${{ env.ECS_CLUSTER }} --query 'clusters[0].status' --output text 2>/dev/null || echo "NOT_FOUND")
           
           if [ "$CLUSTER_STATUS" = "ACTIVE" ]; then
@@ -194,7 +189,6 @@ jobs:
             echo "::warning::ECS cluster status: $CLUSTER_STATUS"
             echo "Waiting for cluster to become active..."
             
-            # Wait up to 5 minutes for cluster to become active
             for i in {1..30}; do
               sleep 10
               CLUSTER_STATUS=$(aws ecs describe-clusters --clusters ${{ env.ECS_CLUSTER }} --query 'clusters[0].status' --output text 2>/dev/null || echo "NOT_FOUND")
@@ -209,30 +203,24 @@ jobs:
               fi
             done
           fi
-          
           echo "Infrastructure is ready!"
 
       - name: Set infrastructure outputs
+        if: ${{ !steps.check-destroy.outputs.destroy_requested }}
         id: infra-outputs
         working-directory: terraform
         run: |
           echo "Setting infrastructure outputs..."
-          
-          # Set basic service names
           echo "cluster-name=${{ env.ECS_CLUSTER }}" >> $GITHUB_OUTPUT
           echo "frontend-service=${{ env.PROJECT_NAME }}-frontend" >> $GITHUB_OUTPUT
           echo "backend-service=${{ env.PROJECT_NAME }}-backend" >> $GITHUB_OUTPUT
           
-          echo "Retrieving ALB DNS..."
-          
-          # Get ALB DNS from Terraform output
           ALB_DNS=""
           if terraform output alb_dns_name >/dev/null 2>&1; then
             ALB_DNS=$(terraform output -raw alb_dns_name 2>/dev/null | tr -d '\r\n')
             echo "Found ALB DNS via Terraform: '$ALB_DNS'"
           fi
           
-          # Fallback to AWS CLI if Terraform output failed
           if [ -z "$ALB_DNS" ]; then
             echo "Terraform ALB DNS failed, trying AWS CLI..."
             ALB_DNS=$(aws elbv2 describe-load-balancers --names "${PROJECT_NAME}-alb" --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
@@ -244,28 +232,21 @@ jobs:
             fi
           fi
           
-          # Validate ALB DNS format
           if [[ ! "$ALB_DNS" =~ ^[a-zA-Z0-9-]+\..*\.elb\.amazonaws\.com$ ]]; then
             echo "::error::Invalid ALB DNS format: $ALB_DNS"
             exit 1
           fi
           
-          # Set outputs
           echo "alb-dns=$ALB_DNS" >> $GITHUB_OUTPUT
-          
           echo "✅ Infrastructure outputs set successfully"
-          echo "Final values:"
-          echo "  ALB DNS: $ALB_DNS"
-          echo "Note: Execution role ARN will be used from GitHub secrets"
 
   build-and-deploy:
     needs: [test, infrastructure]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
+    if: ${{ github.ref == 'refs/heads/main' && !needs.infrastructure.outputs.destroy-requested }}
+    
     steps:
       - uses: actions/checkout@v3
-
 
       - name: Check for AWS credentials secrets
         run: |
@@ -285,12 +266,10 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-
       - name: Verify ECR repositories
         run: |
           echo "Verifying ECR repositories created by Terraform..."
           
-          # Check frontend repository
           if aws ecr describe-repositories --repository-names ${{ env.FRONTEND_ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
             echo "✅ Frontend ECR repository found"
           else
@@ -298,7 +277,6 @@ jobs:
             exit 1
           fi
           
-          # Check backend repository  
           if aws ecr describe-repositories --repository-names ${{ env.BACKEND_ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
             echo "✅ Backend ECR repository found"
           else
@@ -308,8 +286,6 @@ jobs:
           
           echo "✅ All ECR repositories verified"
 
-
-      # Build and push Frontend image
       - name: Build and push Frontend image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -328,7 +304,6 @@ jobs:
           
           echo "✅ Frontend image pushed successfully"
 
-      # Build and push Backend image
       - name: Build and push Backend image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -350,31 +325,19 @@ jobs:
         run: |
           echo "Updating frontend task definition..."
           
-          # Debug: Show all available outputs
-          echo "Debug: Available infrastructure outputs:"
-          echo "  cluster-name: '${{ needs.infrastructure.outputs.cluster-name }}'"
-          echo "  frontend-service: '${{ needs.infrastructure.outputs.frontend-service }}'"
-          echo "  backend-service: '${{ needs.infrastructure.outputs.backend-service }}'"
-          echo "  alb-dns: '${{ needs.infrastructure.outputs.alb-dns }}'"
-          
-          # Use execution role ARN from secrets
           EXECUTION_ROLE_ARN="${{ secrets.ECS_EXECUTION_ROLE_ARN }}"
           echo "Using execution role ARN from secrets: $EXECUTION_ROLE_ARN"
           
-          # Validate required values
           if [ -z "$EXECUTION_ROLE_ARN" ]; then
             echo "::error::ECS_EXECUTION_ROLE_ARN secret not found"
-            echo "::error::Please add ECS_EXECUTION_ROLE_ARN to your repository secrets"
             exit 1
           fi
           
           if [ -z "${{ needs.infrastructure.outputs.alb-dns }}" ]; then
             echo "::error::ALB DNS not found in infrastructure outputs"
-            echo "::error::This indicates the infrastructure job may have failed to set outputs properly"
             exit 1
           fi
           
-          # Update task definition with actual values
           sed -i "s|<FRONTEND_IMAGE>|${{ steps.login-ecr.outputs.registry }}/${{ env.FRONTEND_ECR_REPOSITORY }}:${{ github.sha }}|g" .aws/frontend-task-definition.json
           sed -i "s|<EXECUTION_ROLE_ARN>|$EXECUTION_ROLE_ARN|g" .aws/frontend-task-definition.json
           sed -i "s|<ALB_DNS_NAME>|${{ needs.infrastructure.outputs.alb-dns }}|g" .aws/frontend-task-definition.json
@@ -385,29 +348,23 @@ jobs:
         run: |
           echo "Updating backend task definition..."
           
-          # Use execution role ARN from secrets
           EXECUTION_ROLE_ARN="${{ secrets.ECS_EXECUTION_ROLE_ARN }}"
           echo "Using execution role ARN from secrets: $EXECUTION_ROLE_ARN"
           
-          # Validate required values
           if [ -z "$EXECUTION_ROLE_ARN" ]; then
             echo "::error::ECS_EXECUTION_ROLE_ARN secret not found"
-            echo "::error::Please add ECS_EXECUTION_ROLE_ARN to your repository secrets"
             exit 1
           fi
           
-          # Update task definition with actual values
           sed -i "s|<BACKEND_IMAGE>|${{ steps.login-ecr.outputs.registry }}/${{ env.BACKEND_ECR_REPOSITORY }}:${{ github.sha }}|g" .aws/backend-task-definition.json
           sed -i "s|<EXECUTION_ROLE_ARN>|$EXECUTION_ROLE_ARN|g" .aws/backend-task-definition.json
           
           echo "Backend task definition updated successfully"
 
-      # Validate task definitions before deployment
       - name: Validate task definitions
         run: |
           echo "Validating task definitions..."
           
-          # Check if task definition files exist
           if [ ! -f ".aws/frontend-task-definition.json" ]; then
             echo "::error::Frontend task definition file not found"
             exit 1
@@ -418,7 +375,6 @@ jobs:
             exit 1
           fi
           
-          # Validate JSON syntax
           if ! jq empty .aws/frontend-task-definition.json; then
             echo "::error::Frontend task definition has invalid JSON"
             exit 1
@@ -429,22 +385,18 @@ jobs:
             exit 1
           fi
           
-          # Check for remaining placeholders
           if grep -q "<.*>" .aws/frontend-task-definition.json; then
-            echo "::error::Frontend task definition still contains placeholders:"
-            grep "<.*>" .aws/frontend-task-definition.json
+            echo "::error::Frontend task definition still contains placeholders"
             exit 1
           fi
           
           if grep -q "<.*>" .aws/backend-task-definition.json; then
-            echo "::error::Backend task definition still contains placeholders:"
-            grep "<.*>" .aws/backend-task-definition.json
+            echo "::error::Backend task definition still contains placeholders"
             exit 1
           fi
           
           echo "✅ Task definitions validated successfully"
 
-      # Deploy to ECS
       - name: Deploy Frontend to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
@@ -472,7 +424,6 @@ jobs:
             echo "🔗 Access your application at the URLs above"
           else
             echo "::warning::ALB DNS not available in outputs"
-            # Try to get it directly
             ALB_DNS=$(aws elbv2 describe-load-balancers --names ${{ env.PROJECT_NAME }}-alb --query 'LoadBalancers[0].DNSName' --output text 2>/dev/null || echo "")
             if [ -n "$ALB_DNS" ] && [ "$ALB_DNS" != "None" ]; then
               echo "Frontend URL: http://$ALB_DNS"
