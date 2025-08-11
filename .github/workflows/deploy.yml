@@ -162,11 +162,10 @@ jobs:
       - name: Terraform Apply or Destroy
         working-directory: terraform
         run: |
-          if ${{ steps.check-destroy.outputs.destroy_requested }}; then
+          if [ "${{ steps.check-destroy.outputs.destroy_requested }}" = "true" ]; then
             echo "💥 Destroying infrastructure..."
             terraform apply -destroy -auto-approve tfplan
             echo "✅ Infrastructure destroyed successfully"
-            exit 0
           else
             echo "🚀 Applying Terraform configuration..."
             terraform apply -auto-approve tfplan
