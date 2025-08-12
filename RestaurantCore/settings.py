@@ -37,7 +37,7 @@ SECURE_HSTS_PRELOAD = True
 
 # CORS settings
 CORS_ALLOWED_ORIGINS = [
-    "http://django-nextjs-alb-2114475505.us-west-2.elb.amazonaws.com",
+    "http://django-nextjs-alb-734957308.us-west-2.elb.amazonaws.com",
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
