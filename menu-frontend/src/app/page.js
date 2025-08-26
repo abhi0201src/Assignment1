@@ -9,11 +9,7 @@ import config from '../config';
  * @param {number} id The ID of the menu item to retrieve.
  */
 async function deleteMenu(id) {
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-  if (!apiUrl) {
-    throw new Error('API URL is not configured');
-  }
-  const res = await fetch(`${apiUrl}/api/menu/${id}/`, {
+  const res = await fetch(`${config.apiUrl}/api/menu/${id}/`, {
     method: "DELETE",
   });
   if (!res.ok) {
